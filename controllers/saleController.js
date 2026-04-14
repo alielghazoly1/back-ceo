@@ -9,13 +9,12 @@ const calcItemTotalWeight = (qty, wt)     => (Number(qty)||0) * (Number(wt)||0);
 
 const generateInvoiceNumber = async () => {
   const counter = await Counter.findOneAndUpdate(
-    { name: 'SAL' },
-    { $inc: { value: 1 } },
-    { new: true, upsert: true },
+    { name: 'SAL' }, { $inc: { value: 1 } }, { new: true, upsert: true },
   );
   return `SAL-${String(counter.value).padStart(5, '0')}`;
 };
 
+// ── GET all ──────────────────────────────────────────────
 const getSaleInvoices = async (req, res) => {
   try {
     const { status, warehouse, startDate, endDate, search, customerId, seasonId } = req.query;
@@ -37,15 +36,13 @@ const getSaleInvoices = async (req, res) => {
       ];
     }
     const invoices = await SaleInvoice.find(query)
-      .populate('createdBy', 'name')
-      .populate('approvedBy', 'name')
+      .populate('createdBy', 'name').populate('approvedBy', 'name')
       .sort({ createdAt: -1 });
     res.json(invoices);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
+// ── GET by id ────────────────────────────────────────────
 const getSaleInvoiceById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -62,39 +59,50 @@ const getSaleInvoiceById = async (req, res) => {
       { path: 'season',     select: 'name' },
     ]);
     res.json(invoice);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
-// ── CHECK docNumber — فريد داخل نفس الموسم فقط ────────────
+// ── CHECK docNumber per season ────────────────────────────
+// الإصلاح: بيرجع seasonName عشان الـ frontend يعرض رسالة واضحة
 const checkDocNumber = async (req, res) => {
   try {
     const { docNumber, excludeId, seasonId } = req.query;
 
-    let targetSeasonId = seasonId;
-    if (!targetSeasonId) {
-      const active = await Season.findOne({ isActive: true });
-      targetSeasonId = active?._id;
+    // جلب الـ target season
+    let targetSeason;
+    if (seasonId) {
+      targetSeason = await Season.findById(seasonId);
+    }
+    if (!targetSeason) {
+      targetSeason = await Season.findOne({ isActive: true });
     }
 
     let query = { docNumber };
-    if (targetSeasonId) query.season = targetSeasonId;
-    if (excludeId)      query._id    = { $ne: excludeId };
+    if (targetSeason?._id) query.season = targetSeason._id;
+    if (excludeId)         query._id    = { $ne: excludeId };
 
-    const exists = await SaleInvoice.findOne(query).select('invoiceNumber docNumber');
-    res.json({ exists: !!exists, invoice: exists || null });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+    const exists = await SaleInvoice.findOne(query).select('invoiceNumber docNumber season');
+
+    if (exists) {
+      // جيب اسم الموسم اللي فيه الفاتورة دي
+      let seasonName = targetSeason?.name || 'هذا الموسم';
+      // لو الفاتورة في موسم تاني — جيب اسمه
+      if (exists.season && exists.season.toString() !== targetSeason?._id?.toString()) {
+        const invSeason = await Season.findById(exists.season).select('name');
+        seasonName = invSeason?.name || seasonName;
+      }
+      return res.json({ exists: true, seasonName, invoiceNumber: exists.invoiceNumber });
+    }
+
+    res.json({ exists: false });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
-// ── بحث عن فاتورة بالـ invoiceNumber أو docNumber ─────────
+// ── SEARCH ────────────────────────────────────────────────
 const searchInvoice = async (req, res) => {
   try {
     const { q } = req.query;
     if (!q?.trim()) return res.json([]);
-
     const invoices = await SaleInvoice.find({
       $or: [
         { invoiceNumber: { $regex: q, $options: 'i' } },
@@ -108,13 +116,11 @@ const searchInvoice = async (req, res) => {
       .populate('season', 'name')
       .sort({ createdAt: -1 })
       .limit(10);
-
     res.json(invoices);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
+// ── CREATE ────────────────────────────────────────────────
 const createSaleInvoice = async (req, res) => {
   try {
     const {
@@ -125,13 +131,11 @@ const createSaleInvoice = async (req, res) => {
 
     const activeSeason = await Season.findOne({ isActive: true });
 
-    const docExists = await SaleInvoice.findOne({
-      docNumber,
-      season: activeSeason?._id,
-    });
+    // التحقق داخل نفس الموسم فقط
+    const docExists = await SaleInvoice.findOne({ docNumber, season: activeSeason?._id });
     if (docExists) {
       return res.status(400).json({
-        message: `رقم المستند "${docNumber}" موجود بالفعل في الموسم الحالي (فاتورة ${docExists.invoiceNumber})`,
+        message: `رقم المستند "${docNumber}" موجود بالفعل في الموسم الحالي (${docExists.invoiceNumber})`,
       });
     }
 
@@ -158,19 +162,15 @@ const createSaleInvoice = async (req, res) => {
     const invoice = await SaleInvoice.create({
       invoiceNumber, docNumber,
       date: date || Date.now(),
-      customer: customerId,
-      customerCode, customerName,
-      warehouse,
-      items: recalcItems,
-      totalAmount, totalWeight,
+      customer: customerId, customerCode, customerName,
+      warehouse, items: recalcItems, totalAmount, totalWeight,
       paidAmount:     Number(paidAmount)     || 0,
       cashAmount:     Number(cashAmount)     || 0,
       instapayAmount: Number(instapayAmount) || 0,
       paymentMethod:  paymentMethod || 'credit',
       status: 'pending',
       season: activeSeason?._id,
-      notes,
-      createdBy: req.user._id,
+      notes, createdBy: req.user._id,
     });
 
     res.status(201).json(invoice);
@@ -181,14 +181,12 @@ const createSaleInvoice = async (req, res) => {
   }
 };
 
-// ── تعديل عادي للفواتير غير الموافق عليها ─────────────────
+// ── UPDATE ────────────────────────────────────────────────
 const updateSaleInvoice = async (req, res) => {
   try {
     const invoice = await SaleInvoice.findById(req.params.id);
-    if (!invoice)
-      return res.status(404).json({ message: 'الفاتورة مش موجودة' });
-    if (invoice.status === 'cancelled')
-      return res.status(400).json({ message: 'الفاتورة ملغية' });
+    if (!invoice)                return res.status(404).json({ message: 'الفاتورة مش موجودة' });
+    if (invoice.status === 'cancelled') return res.status(400).json({ message: 'الفاتورة ملغية' });
 
     const wasApproved = invoice.status === 'approved';
     if (wasApproved) {
@@ -214,14 +212,11 @@ const updateSaleInvoice = async (req, res) => {
     }
 
     const recalcItems = items.map(i => ({ ...i, total: calcItemTotal(i.quantity, i.weight, i.price) }));
-    const totalAmount = recalcItems.reduce((s, i) => s + i.total, 0);
-    const totalWeight = recalcItems.reduce((s, i) => s + calcItemTotalWeight(i.quantity, i.weight), 0);
-
     invoice.docNumber      = docNumber      || invoice.docNumber;
     invoice.date           = date           || invoice.date;
     invoice.items          = recalcItems;
-    invoice.totalAmount    = totalAmount;
-    invoice.totalWeight    = totalWeight;
+    invoice.totalAmount    = recalcItems.reduce((s, i) => s + i.total, 0);
+    invoice.totalWeight    = recalcItems.reduce((s, i) => s + calcItemTotalWeight(i.quantity, i.weight), 0);
     invoice.paidAmount     = Number(paidAmount)     || 0;
     invoice.cashAmount     = Number(cashAmount)     || 0;
     invoice.instapayAmount = Number(instapayAmount) || 0;
@@ -233,21 +228,16 @@ const updateSaleInvoice = async (req, res) => {
 
     await invoice.save();
     res.json({ message: 'تم التعديل ✅', invoice });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
-// ── FORCE EDIT للأدمن — حتى لو الفاتورة موافق عليها ────────
+// ── FORCE EDIT للأدمن ─────────────────────────────────────
 const forceEditSaleInvoice = async (req, res) => {
   try {
     const invoice = await SaleInvoice.findById(req.params.id);
-    if (!invoice)
-      return res.status(404).json({ message: 'الفاتورة مش موجودة' });
-    if (invoice.status === 'cancelled')
-      return res.status(400).json({ message: 'الفاتورة ملغية' });
+    if (!invoice)                return res.status(404).json({ message: 'الفاتورة مش موجودة' });
+    if (invoice.status === 'cancelled') return res.status(400).json({ message: 'الفاتورة ملغية' });
 
-    // ارجع المخزون لو موافق عليها
     if (invoice.status === 'approved') {
       for (const saleItem of invoice.items) {
         await Item.findByIdAndUpdate(saleItem.item, {
@@ -260,10 +250,7 @@ const forceEditSaleInvoice = async (req, res) => {
       await StockMovement.deleteMany({ referenceId: invoice._id });
     }
 
-    const {
-      docNumber, date, items, paidAmount, cashAmount,
-      instapayAmount, paymentMethod, notes, editNotes,
-    } = req.body;
+    const { docNumber, date, items, paidAmount, cashAmount, instapayAmount, paymentMethod, notes, editNotes } = req.body;
 
     if (docNumber && docNumber !== invoice.docNumber) {
       const docExists = await SaleInvoice.findOne({
@@ -274,14 +261,11 @@ const forceEditSaleInvoice = async (req, res) => {
     }
 
     const recalcItems = items.map(i => ({ ...i, total: calcItemTotal(i.quantity, i.weight, i.price) }));
-    const totalAmount = recalcItems.reduce((s, i) => s + i.total, 0);
-    const totalWeight = recalcItems.reduce((s, i) => s + calcItemTotalWeight(i.quantity, i.weight), 0);
-
     invoice.docNumber      = docNumber      || invoice.docNumber;
     invoice.date           = date           || invoice.date;
     invoice.items          = recalcItems;
-    invoice.totalAmount    = totalAmount;
-    invoice.totalWeight    = totalWeight;
+    invoice.totalAmount    = recalcItems.reduce((s, i) => s + i.total, 0);
+    invoice.totalWeight    = recalcItems.reduce((s, i) => s + calcItemTotalWeight(i.quantity, i.weight), 0);
     invoice.paidAmount     = Number(paidAmount)     || 0;
     invoice.cashAmount     = Number(cashAmount)     || 0;
     invoice.instapayAmount = Number(instapayAmount) || 0;
@@ -301,72 +285,52 @@ const forceEditSaleInvoice = async (req, res) => {
       { path: 'editedBy',  select: 'name' },
       { path: 'season',    select: 'name' },
     ]);
-
     res.json({ message: 'تم التعديل بواسطة الأدمن ✅', invoice });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
+// ── APPROVE ───────────────────────────────────────────────
 const approveSaleInvoice = async (req, res) => {
   try {
     const invoice = await SaleInvoice.findById(req.params.id);
-    if (!invoice)     return res.status(404).json({ message: 'الفاتورة مش موجودة' });
+    if (!invoice)               return res.status(404).json({ message: 'الفاتورة مش موجودة' });
     if (invoice.status === 'approved')  return res.status(400).json({ message: 'اتوافق عليها قبل كده' });
     if (invoice.status === 'cancelled') return res.status(400).json({ message: 'الفاتورة ملغية' });
 
     for (const saleItem of invoice.items) {
       const tw = calcItemTotalWeight(saleItem.quantity, saleItem.weight);
       await Item.findByIdAndUpdate(saleItem.item, {
-        $inc: {
-          [`stock.${invoice.warehouse}.quantity`]: -saleItem.quantity,
-          [`stock.${invoice.warehouse}.weight`]:   -tw,
-        },
+        $inc: { [`stock.${invoice.warehouse}.quantity`]: -saleItem.quantity, [`stock.${invoice.warehouse}.weight`]: -tw },
         $set: { lastSalePrice: saleItem.price },
       });
       await StockMovement.create({
-        item:           saleItem.item,
-        itemCode:       saleItem.itemCode,
-        itemName:       saleItem.itemName,
-        type:           'sale',
-        quantity:       -saleItem.quantity,
-        weight:         -tw,
-        price:          saleItem.price,
-        warehouse:      invoice.warehouse,
-        reference:      invoice.invoiceNumber,
-        referenceModel: 'SaleInvoice',
-        referenceId:    invoice._id,
-        season:         invoice.season,
-        createdBy:      req.user._id,
-        date:           invoice.date,
+        item: saleItem.item, itemCode: saleItem.itemCode, itemName: saleItem.itemName,
+        type: 'sale', quantity: -saleItem.quantity, weight: -tw, price: saleItem.price,
+        warehouse: invoice.warehouse, reference: invoice.invoiceNumber,
+        referenceModel: 'SaleInvoice', referenceId: invoice._id,
+        season: invoice.season, createdBy: req.user._id, date: invoice.date,
       });
     }
-
-    invoice.status     = 'approved';
-    invoice.approvedBy = req.user._id;
-    invoice.approvedAt = new Date();
+    invoice.status = 'approved'; invoice.approvedBy = req.user._id; invoice.approvedAt = new Date();
     await invoice.save();
     res.json({ message: 'تم الموافقة ✅', invoice });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
+// ── SUSPEND ───────────────────────────────────────────────
 const suspendSaleInvoice = async (req, res) => {
   try {
     const invoice = await SaleInvoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ message: 'الفاتورة مش موجودة' });
     if (invoice.status === 'approved')
       return res.status(400).json({ message: 'مينفعش تعلق فاتورة موافق عليها' });
-    invoice.status        = 'suspended';
-    invoice.suspendReason = req.body.reason || '';
+    invoice.status = 'suspended'; invoice.suspendReason = req.body.reason || '';
     await invoice.save();
     res.json({ message: 'تم التعليق', invoice });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
+// ── CANCEL ────────────────────────────────────────────────
 const cancelSaleInvoice = async (req, res) => {
   try {
     const invoice = await SaleInvoice.findById(req.params.id);
@@ -375,9 +339,7 @@ const cancelSaleInvoice = async (req, res) => {
       return res.status(400).json({ message: 'مينفعش تلغي فاتورة موافق عليها — عدّلها الأول' });
     await SaleInvoice.findByIdAndDelete(invoice._id);
     res.json({ message: 'تم الحذف النهائي' });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 };
 
 module.exports = {
