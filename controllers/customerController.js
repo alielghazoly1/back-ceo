@@ -23,25 +23,38 @@ const getCustomers = async (req, res) => {
 
     const customersWithBalance = await Promise.all(
       customers.map(async (c) => {
-        const [invoices, payments] = await Promise.all([
+        const [allInvoices, creditInvoices, payments] = await Promise.all([
+          // كل الفواتير — للإحصاء والعرض
           SaleInvoice.find({
             customer: c._id,
             status: { $in: ['approved', 'pending'] },
+          }).select('totalAmount paymentMethod'),
+          // الآجل فقط — للرصيد المستحق
+          SaleInvoice.find({
+            customer: c._id,
+            status: { $in: ['approved', 'pending'] },
+            paymentMethod: 'credit',
           }).select('totalAmount'),
+          // دفعات الآجل
           Payment.find({ customer: c._id, type: 'customer_payment' }).select(
             'amount',
           ),
         ]);
-        const totalSales = invoices.reduce(
+        const totalSales = allInvoices.reduce(
+          (s, i) => s + (i.totalAmount || 0),
+          0,
+        );
+        const creditSales = creditInvoices.reduce(
           (s, i) => s + (i.totalAmount || 0),
           0,
         );
         const totalPaid = payments.reduce((s, p) => s + (p.amount || 0), 0);
         return {
           ...c.toObject(),
-          totalSales,
-          totalPaid,
-          balance: totalSales - totalPaid,
+          totalSales, // كل المبيعات (للعرض)
+          creditSales, // الآجل فقط
+          totalPaid, // دفعات الآجل
+          balance: creditSales - totalPaid, // الرصيد = آجل - مدفوع (النقدي مش مستحق)
         };
       }),
     );
@@ -71,12 +84,20 @@ const getCustomerStatement = async (req, res) => {
 
     const seasonFilter = targetSeason ? { season: targetSeason._id } : {};
 
-    const [invoices, returns, payments] = await Promise.all([
+    const [invoices, creditInvoices, returns, payments] = await Promise.all([
+      // كل الفواتير — للعرض الكامل في كشف الحساب
       SaleInvoice.find({
         customer: customerId,
         status: { $in: ['approved', 'pending'] },
         ...seasonFilter,
       }).sort({ date: 1 }),
+      // الآجل فقط — لحساب الرصيد المستحق
+      SaleInvoice.find({
+        customer: customerId,
+        status: { $in: ['approved', 'pending'] },
+        paymentMethod: 'credit',
+        ...seasonFilter,
+      }).select('totalAmount'),
       ReturnInvoice.find({
         customer: customerId,
         type: 'customer_return',
@@ -90,11 +111,15 @@ const getCustomerStatement = async (req, res) => {
       }).sort({ date: 1 }),
     ]);
 
-    const totalSales = invoices.reduce((s, i) => s + (i.totalAmount || 0), 0);
+    const totalSales = invoices.reduce((s, i) => s + (i.totalAmount || 0), 0); // كل المبيعات
+    const creditTotal = creditInvoices.reduce(
+      (s, i) => s + (i.totalAmount || 0),
+      0,
+    ); // الآجل فقط
     const totalReturns = returns.reduce((s, r) => s + (r.totalAmount || 0), 0);
     const totalPaid = payments.reduce((s, p) => s + (p.amount || 0), 0);
-    const netSales = totalSales - totalReturns;
-    const balance = netSales - totalPaid;
+    const netSales = totalSales - totalReturns; // صافي كل المبيعات
+    const balance = creditTotal - totalPaid; // الرصيد = آجل فقط - مدفوع
 
     const lastPrices = {};
     invoices.forEach((inv) => {
@@ -303,6 +328,52 @@ const getCustomerAllSeasons = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// getSupplierAllSeasons — كل مواسم المورد مع رصيد كل موسم
+// ─────────────────────────────────────────────────────────────────────────────
+const getSupplierAllSeasons = async (req, res) => {
+  try {
+    const { supplierId } = req.params;
+    const PurchaseInvoice = require('../models/PurchaseInvoice');
+    const seasons = await Season.find().sort({ startDate: -1 });
+    const result = await Promise.all(
+      seasons.map(async (season) => {
+        const [invoices, payments] = await Promise.all([
+          PurchaseInvoice.find({
+            supplier: supplierId,
+            season: season._id,
+            status: { $nin: ['cancelled'] },
+          }).select('totalAmount'),
+          Payment.find({
+            supplier: supplierId,
+            season: season._id,
+            type: 'supplier_payment',
+          }).select('amount'),
+        ]);
+        const totalPurchases = invoices.reduce(
+          (s, i) => s + (i.totalAmount || 0),
+          0,
+        );
+        const totalPaid = payments.reduce((s, p) => s + (p.amount || 0), 0);
+        return {
+          season: {
+            _id: season._id,
+            name: season.name,
+            isActive: season.isActive,
+          },
+          totalPurchases,
+          totalPaid,
+          balance: totalPurchases - totalPaid,
+          invoiceCount: invoices.length,
+        };
+      }),
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 const getSupplierStatement = async (req, res) => {
   try {
     const { supplierId } = req.params;
@@ -472,12 +543,131 @@ const deleteCustomer = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// getSupplierItemStatement — كشف صنف عند مورد معين
+// ─────────────────────────────────────────────────────────────────────────────
+const getSupplierItemStatement = async (req, res) => {
+  try {
+    const { supplierId, itemId } = req.params;
+    const { seasonId } = req.query;
+    const PurchaseInvoice = require('../models/PurchaseInvoice');
+    const ReturnInvoice = require('../models/ReturnInvoice');
+    const Item = require('../models/Item');
+    const Supplier = require('../models/Supplier');
+
+    const [supplier, item] = await Promise.all([
+      Supplier.findById(supplierId),
+      Item.findById(itemId),
+    ]);
+    if (!supplier) return res.status(404).json({ message: 'المورد مش موجود' });
+    if (!item) return res.status(404).json({ message: 'الصنف مش موجود' });
+
+    const seasonFilter = seasonId ? { season: seasonId } : {};
+
+    const [invoices, returns] = await Promise.all([
+      PurchaseInvoice.find({
+        supplier: supplierId,
+        status: { $nin: ['cancelled'] },
+        'items.item': itemId,
+        ...seasonFilter,
+      })
+        .populate('season', 'name')
+        .sort({ date: -1 }),
+      ReturnInvoice.find({
+        supplier: supplierId,
+        type: 'supplier_return',
+        status: 'approved',
+        'items.item': itemId,
+        ...seasonFilter,
+      })
+        .populate('season', 'name')
+        .sort({ date: -1 }),
+    ]);
+
+    const movements = [];
+
+    invoices.forEach((inv) => {
+      const invItem = inv.items.find((i) => i.item.toString() === itemId);
+      if (!invItem) return;
+      const qty = Number(invItem.quantity) || 0;
+      const wt = Number(invItem.weight) || 0;
+      const pr = Number(invItem.price) || 0;
+      movements.push({
+        type: 'purchase',
+        date: inv.date,
+        createdAt: inv.createdAt,
+        invoiceNumber: inv.invoiceNumber,
+        invoiceId: inv._id,
+        docNumber: inv.docNumber,
+        warehouse: inv.warehouse,
+        season: inv.season,
+        quantity: qty,
+        weight: wt,
+        totalWeight: qty * wt,
+        price: pr,
+        total: qty * wt * pr,
+        status: inv.status,
+      });
+    });
+
+    returns.forEach((ret) => {
+      const retItem = ret.items.find((i) => i.item.toString() === itemId);
+      if (!retItem) return;
+      const qty = Number(retItem.quantity) || 0;
+      const wt = Number(retItem.weight) || 0;
+      const pr = Number(retItem.price) || 0;
+      movements.push({
+        type: 'return',
+        date: ret.date,
+        createdAt: ret.createdAt,
+        invoiceNumber: ret.invoiceNumber,
+        invoiceId: ret._id,
+        docNumber: ret.docNumber,
+        warehouse: ret.warehouse,
+        season: ret.season,
+        quantity: qty,
+        weight: wt,
+        totalWeight: qty * wt,
+        price: pr,
+        total: qty * wt * pr,
+        status: ret.status,
+      });
+    });
+
+    movements.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    const purMoves = movements.filter((m) => m.type === 'purchase');
+    const retMoves = movements.filter((m) => m.type === 'return');
+
+    res.json({
+      supplier,
+      item: {
+        _id: item._id,
+        code: item.code,
+        name: item.name,
+        unit: item.unit,
+      },
+      movements,
+      totalQty: purMoves.reduce((s, m) => s + m.quantity, 0),
+      totalWeight: purMoves.reduce((s, m) => s + m.totalWeight, 0),
+      totalAmount: purMoves.reduce((s, m) => s + m.total, 0),
+      returnQty: retMoves.reduce((s, m) => s + m.quantity, 0),
+      returnWeight: retMoves.reduce((s, m) => s + m.totalWeight, 0),
+      lastPrice: purMoves[0]?.price || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 module.exports = {
   getCustomers,
   getCustomerStatement,
   getCustomerItemStatement,
   getCustomerAllSeasons,
+  getSupplierAllSeasons,
   getSupplierStatement,
+  getSupplierItemStatement,
   createCustomer,
   updateCustomer,
   deleteCustomer,

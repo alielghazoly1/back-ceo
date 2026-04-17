@@ -8,21 +8,52 @@ const Season          = require('../models/Season');
 const StockMovement   = require('../models/StockMovement');
 const Payment         = require('../models/Payment');
 
+// ── getGeneralStats ────────────────────────────────────────────────────────────
 const getGeneralStats = async (req, res) => {
   try {
-    const activeSeason = await Season.findOne({ isActive: true });
+    const { seasonId } = req.query;
+
+    let activeSeason;
+    if (seasonId) {
+      activeSeason = await Season.findById(seasonId);
+    } else {
+      activeSeason = await Season.findOne({ isActive: true });
+    }
     const seasonFilter = activeSeason ? { season: activeSeason._id } : {};
 
     const [
-      salesAgg, purchasesAgg, returnsAgg,
+      // كل المبيعات المعتمدة (نقدي + آجل) — لحساب إجمالي المبيعات والأرباح
+      allSalesAgg,
+      // المبيعات الآجلة فقط — لحساب المستحق
+      creditSalesAgg,
+      // المبيعات النقدية — للإحصاء
+      cashSalesAgg,
+      purchasesAgg,
+      supplierReturnsAgg,
       customerReturnsAgg,
-      pendingSales, pendingPurchases, pendingReturns, pendingTransfers,
-      totalCustomers, totalItems,
+      pendingSales,
+      pendingPurchases,
+      pendingReturns,
+      pendingTransfers,
+      totalCustomers,
+      totalItems,
+      // المدفوعات الإضافية (دفعات العملاء الآجلين)
       totalCollected,
     ] = await Promise.all([
+      // كل المبيعات
       SaleInvoice.aggregate([
         { $match: { status: 'approved', ...seasonFilter } },
         { $group: { _id: null, total: { $sum: '$totalAmount' }, count: { $sum: 1 } } },
+      ]),
+      // آجل فقط
+      SaleInvoice.aggregate([
+        { $match: { status: 'approved', paymentMethod: 'credit', ...seasonFilter } },
+        { $group: { _id: null, total: { $sum: '$totalAmount' }, count: { $sum: 1 } } },
+      ]),
+      // نقدي فقط (cash + instapay + transfer + check + mixed)
+      SaleInvoice.aggregate([
+        { $match: { status: 'approved', paymentMethod: { $ne: 'credit' }, ...seasonFilter } },
+        { $group: { _id: null, total: { $sum: '$totalAmount' }, count: { $sum: 1 }, collected: { $sum: '$paidAmount' } } },
       ]),
       PurchaseInvoice.aggregate([
         { $match: { status: 'approved', ...seasonFilter } },
@@ -42,42 +73,77 @@ const getGeneralStats = async (req, res) => {
       Transfer.countDocuments({ status: 'pending' }),
       Customer.countDocuments({ isActive: true }),
       Item.countDocuments({ isActive: true }),
+      // دفعات العملاء الآجلين فقط
       Payment.aggregate([
         { $match: { type: 'customer_payment', ...(activeSeason ? { season: activeSeason._id } : {}) } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
     ]);
 
-    const totalSales      = salesAgg[0]?.total || 0;
-    const totalPurchases  = purchasesAgg[0]?.total || 0;
-    const supplierReturns = returnsAgg[0]?.total || 0;
+    const totalSales      = allSalesAgg[0]?.total      || 0;
+    const creditSales     = creditSalesAgg[0]?.total   || 0;
+    const cashSalesTotal  = cashSalesAgg[0]?.total     || 0;
+    const cashCollected   = cashSalesAgg[0]?.collected || 0; // مدفوع من الفواتير النقدية
+    const totalPurchases  = purchasesAgg[0]?.total     || 0;
+    const supplierReturns = supplierReturnsAgg[0]?.total || 0;
     const customerReturns = customerReturnsAgg[0]?.total || 0;
-    const netSales        = totalSales - customerReturns;
-    const netPurchases    = totalPurchases - supplierReturns;
-    const grossProfit     = netSales - netPurchases;
-    const collected       = totalCollected[0]?.total || 0;
-    const outstanding     = netSales - collected;
+
+    const netSales       = totalSales - customerReturns;
+    const netPurchases   = totalPurchases - supplierReturns;
+    const grossProfit    = netSales - netPurchases;
+
+    // ── التحصيل ─────────────────────────────────────────────────────────────
+    // المستحق = الآجل فقط - دفعات العملاء (Payment model)
+    // الفواتير النقدية مدفوعة عند الموافقة — مش مستحقة
+    const creditNetSales  = creditSales;   // آجل بعد المرتجعات (مبسط)
+    const paymentsFromCustomers = totalCollected[0]?.total || 0;
+    const outstanding     = creditSales - paymentsFromCustomers;
+
+    // إجمالي المحصل = نقدي محصل عند الفاتورة + دفعات آجل
+    const totalCollectedAll = cashCollected + paymentsFromCustomers;
 
     res.json({
       season: activeSeason || null,
-      // المبيعات
-      totalSales,
-      salesCount: salesAgg[0]?.count || 0,
+
+      // ── المبيعات ──────────────────────────────
+      totalSales,            // كل المبيعات (نقدي + آجل)
+      salesCount:    allSalesAgg[0]?.count || 0,
       customerReturns,
       netSales,
-      // التوريد
+
+      // تفاصيل نقدي vs آجل
+      cashSalesTotal,        // إجمالي النقدي
+      cashSalesCount:  cashSalesAgg[0]?.count  || 0,
+      creditSales,           // إجمالي الآجل
+      creditSalesCount: creditSalesAgg[0]?.count || 0,
+
+      // ── التوريد ──────────────────────────────
       totalPurchases,
       purchasesCount: purchasesAgg[0]?.count || 0,
       supplierReturns,
       netPurchases,
-      // الأرباح
+
+      // ── الأرباح ──────────────────────────────
       grossProfit,
       profitMargin: netSales > 0 ? ((grossProfit / netSales) * 100).toFixed(1) : 0,
-      // التحصيل
-      collected,
+
+      // ── التحصيل ──────────────────────────────
+      // النقدي محصل فعلاً عند الفاتورة
+      cashCollected,
+      // دفعات العملاء الآجلين
+      collected: paymentsFromCustomers,
+      // إجمالي المحصل (نقدي + دفعات)
+      totalCollectedAll,
+      // المتبقي من الآجل فقط
       outstanding,
-      // في الانتظار
-      pending: { sales: pendingSales, purchases: pendingPurchases, returns: pendingReturns, transfers: pendingTransfers },
+
+      // ── انتظار موافقة ──────────────────────
+      pending: {
+        sales:     pendingSales,
+        purchases: pendingPurchases,
+        returns:   pendingReturns,
+        transfers: pendingTransfers,
+      },
       totalCustomers,
       totalItems,
     });
@@ -87,9 +153,10 @@ const getGeneralStats = async (req, res) => {
   }
 };
 
+// ── getTodayMovements ──────────────────────────────────────────────────────────
 const getTodayMovements = async (req, res) => {
   try {
-    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const start = new Date(); start.setHours(0,  0,  0,   0);
     const end   = new Date(); end.setHours(23, 59, 59, 999);
     const f     = { createdAt: { $gte: start, $lte: end } };
 
@@ -100,15 +167,23 @@ const getTodayMovements = async (req, res) => {
       Transfer.find(f).populate('createdBy', 'name').sort({ createdAt: -1 }).lean(),
     ]);
 
-    const salesTotal = sales.filter(s => s.status === 'approved').reduce((s, i) => s + i.totalAmount, 0);
+    const approved     = sales.filter(s => s.status === 'approved');
+    const salesTotal   = approved.reduce((s, i) => s + i.totalAmount, 0);
+    const cashTotal    = approved.filter(i => i.paymentMethod !== 'credit').reduce((s, i) => s + i.paidAmount, 0);
+    const creditTotal  = approved.filter(i => i.paymentMethod === 'credit').reduce((s, i) => s + i.totalAmount, 0);
     const purchasesTotal = purchases.filter(p => p.status === 'approved').reduce((s, i) => s + i.totalAmount, 0);
 
-    res.json({ sales, purchases, returns, transfers, date: new Date(), salesTotal, purchasesTotal });
+    res.json({
+      sales, purchases, returns, transfers,
+      date: new Date(),
+      salesTotal, cashTotal, creditTotal, purchasesTotal,
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
+// ── getStockReport ─────────────────────────────────────────────────────────────
 const getStockReport = async (req, res) => {
   try {
     const { warehouse } = req.query;
@@ -128,6 +203,7 @@ const getStockReport = async (req, res) => {
   }
 };
 
+// ── getUserMovements ───────────────────────────────────────────────────────────
 const getUserMovements = async (req, res) => {
   try {
     const { userId } = req.params;
@@ -150,6 +226,7 @@ const getUserMovements = async (req, res) => {
   }
 };
 
+// ── getCustomerItemPrices ──────────────────────────────────────────────────────
 const getCustomerItemPrices = async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -158,7 +235,10 @@ const getCustomerItemPrices = async (req, res) => {
     invoices.forEach(inv => {
       inv.items.forEach(item => {
         if (!lastPrices[item.itemCode]) {
-          lastPrices[item.itemCode] = { itemName: item.itemName, price: item.price, date: inv.date, invoiceNumber: inv.invoiceNumber };
+          lastPrices[item.itemCode] = {
+            itemName: item.itemName, price: item.price,
+            date: inv.date, invoiceNumber: inv.invoiceNumber,
+          };
         }
       });
     });
@@ -168,4 +248,7 @@ const getCustomerItemPrices = async (req, res) => {
   }
 };
 
-module.exports = { getGeneralStats, getTodayMovements, getStockReport, getUserMovements, getCustomerItemPrices };
+module.exports = {
+  getGeneralStats, getTodayMovements, getStockReport,
+  getUserMovements, getCustomerItemPrices,
+};

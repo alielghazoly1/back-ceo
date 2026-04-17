@@ -4,11 +4,6 @@ const StockMovement = require('../models/StockMovement');
 const Season = require('../models/Season');
 const Counter = require('../models/Counter');
 
-// weight = وزن الكرتونة | total = qty × weight × price
-const calcItemTotal = (qty, wt, pr) =>
-  (Number(qty) || 0) * (Number(wt) || 0) * (Number(pr) || 0);
-const calcItemTotalWeight = (qty, wt) => (Number(qty) || 0) * (Number(wt) || 0);
-
 const generateInvoiceNumber = async (prefix = 'PUR') => {
   const counter = await Counter.findOneAndUpdate(
     { name: prefix },
@@ -18,51 +13,10 @@ const generateInvoiceNumber = async (prefix = 'PUR') => {
   return `${prefix}-${String(counter.value).padStart(5, '0')}`;
 };
 
-// ── helper: تطبيق الفاتورة على المخزن ─────────────────────
-const applyInvoiceToStock = async (invoice, userId) => {
-  for (const inv of invoice.items) {
-    const tw = calcItemTotalWeight(inv.quantity, inv.weight);
-    await Item.findByIdAndUpdate(inv.item, {
-      $inc: {
-        [`stock.${invoice.warehouse}.quantity`]: inv.quantity,
-        [`stock.${invoice.warehouse}.weight`]: tw,
-      },
-      $set: { lastPurchasePrice: inv.price },
-    });
-    await StockMovement.create({
-      item: inv.item,
-      itemCode: inv.itemCode,
-      itemName: inv.itemName,
-      type: 'purchase',
-      quantity: inv.quantity,
-      weight: tw,
-      price: inv.price,
-      warehouse: invoice.warehouse,
-      reference: invoice.invoiceNumber,
-      referenceModel: 'PurchaseInvoice',
-      referenceId: invoice._id,
-      season: invoice.season,
-      createdBy: userId,
-      date: invoice.date,
-    });
-  }
-};
+const calcItemTotal = (quantity, weight, price) =>
+  (Number(quantity) || 0) * (Number(weight) || 0) * (Number(price) || 0);
 
-// ── helper: إرجاع الفاتورة من المخزن ─────────────────────
-const revertInvoiceFromStock = async (invoice) => {
-  for (const inv of invoice.items) {
-    const tw = calcItemTotalWeight(inv.quantity, inv.weight);
-    await Item.findByIdAndUpdate(inv.item, {
-      $inc: {
-        [`stock.${invoice.warehouse}.quantity`]: -inv.quantity,
-        [`stock.${invoice.warehouse}.weight`]: -tw,
-      },
-    });
-  }
-  await StockMovement.deleteMany({ referenceId: invoice._id });
-};
-
-// ─────────────────────────────────────────────────────────
+// ── GET all ──────────────────────────────────────────────────────────────────
 const getPurchaseInvoices = async (req, res) => {
   try {
     const { status, warehouse, startDate, endDate, search, seasonId } =
@@ -70,7 +24,7 @@ const getPurchaseInvoices = async (req, res) => {
     let query = {};
     if (status) query.status = status;
     if (warehouse) query.warehouse = warehouse;
-    if (seasonId) query.season = seasonId;
+    if (seasonId) query.season = seasonId; // ← مضاف
     if (startDate || endDate) {
       query.date = {};
       if (startDate) query.date.$gte = new Date(startDate);
@@ -87,6 +41,7 @@ const getPurchaseInvoices = async (req, res) => {
     const invoices = await PurchaseInvoice.find(query)
       .populate('createdBy', 'name')
       .populate('approvedBy', 'name')
+      .populate('season', 'name') // ← مضاف
       .sort({ createdAt: -1 });
     res.json(invoices);
   } catch (err) {
@@ -94,6 +49,7 @@ const getPurchaseInvoices = async (req, res) => {
   }
 };
 
+// ── GET by id ─────────────────────────────────────────────────────────────────
 const getPurchaseInvoiceById = async (req, res) => {
   try {
     const invoice = await PurchaseInvoice.findById(req.params.id)
@@ -110,28 +66,28 @@ const getPurchaseInvoiceById = async (req, res) => {
   }
 };
 
+// ── CHECK docNumber per season ────────────────────────────────────────────────
 const checkDocNumber = async (req, res) => {
   try {
     const { docNumber, excludeId, seasonId } = req.query;
-    let targetSeasonId = seasonId;
-    if (!targetSeasonId) {
-      const active = await Season.findOne({ isActive: true });
-      targetSeasonId = active?._id;
-    }
+    if (!docNumber?.trim()) return res.json({ exists: false });
+
+    let targetSeason;
+    if (seasonId) targetSeason = await Season.findById(seasonId);
+    if (!targetSeason) targetSeason = await Season.findOne({ isActive: true });
+
     let query = { docNumber };
-    if (targetSeasonId) query.season = targetSeasonId;
+    if (targetSeason?._id) query.season = targetSeason._id;
     if (excludeId) query._id = { $ne: excludeId };
-    const exists = await PurchaseInvoice.findOne(query).select(
-      'invoiceNumber docNumber',
-    );
-    res.json({ exists: !!exists, invoice: exists || null });
+
+    const exists = await PurchaseInvoice.findOne(query).select('invoiceNumber');
+    res.json({ exists: !!exists, invoiceNumber: exists?.invoiceNumber });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// ── CREATE ─────────────────────────────────────────────────
-// applyToStock = true → بيطبق على المخزن علطول بدون موافقة
+// ── CREATE ────────────────────────────────────────────────────────────────────
 const createPurchaseInvoice = async (req, res) => {
   try {
     const {
@@ -143,37 +99,24 @@ const createPurchaseInvoice = async (req, res) => {
       warehouse,
       items,
       notes,
-      applyToStock = false, // ← جديد: فوري على المخزن؟
     } = req.body;
 
     if (!items?.length)
       return res.status(400).json({ message: 'لازم تضيف صنف واحد على الأقل' });
 
-    const activeSeason = await Season.findOne({ isActive: true });
-
-    const docExists = await PurchaseInvoice.findOne({
-      docNumber,
-      season: activeSeason?._id,
-    });
-    if (docExists) {
-      return res.status(400).json({
-        message: `رقم المستند "${docNumber}" موجود بالفعل في الموسم الحالي (${docExists.invoiceNumber})`,
-      });
-    }
-
     const recalcItems = items.map((i) => ({
       ...i,
       total: calcItemTotal(i.quantity, i.weight, i.price),
     }));
+
+    const activeSeason = await Season.findOne({ isActive: true });
     const invoiceNumber = await generateInvoiceNumber('PUR');
-    const totalAmount = recalcItems.reduce((s, i) => s + i.total, 0);
+
+    const totalAmount = recalcItems.reduce((sum, i) => sum + i.total, 0);
     const totalWeight = recalcItems.reduce(
-      (s, i) => s + calcItemTotalWeight(i.quantity, i.weight),
+      (sum, i) => sum + Number(i.weight) * Number(i.quantity),
       0,
     );
-
-    // لو applyToStock = true → حالة الفاتورة تبقى approved على طول
-    const status = applyToStock ? 'approved' : 'pending';
 
     const invoice = await PurchaseInvoice.create({
       invoiceNumber,
@@ -186,18 +129,11 @@ const createPurchaseInvoice = async (req, res) => {
       items: recalcItems,
       totalAmount,
       totalWeight,
-      status,
+      status: 'pending',
       season: activeSeason?._id,
       notes,
       createdBy: req.user._id,
-      approvedBy: applyToStock ? req.user._id : undefined,
-      approvedAt: applyToStock ? new Date() : undefined,
     });
-
-    // لو فوري — طبّق على المخزن
-    if (applyToStock) {
-      await applyInvoiceToStock(invoice, req.user._id);
-    }
 
     res.status(201).json(invoice);
   } catch (err) {
@@ -209,7 +145,7 @@ const createPurchaseInvoice = async (req, res) => {
   }
 };
 
-// ── FORCE EDIT للأدمن ──────────────────────────────────────
+// ── FORCE EDIT (أدمن) ─────────────────────────────────────────────────────────
 const forceEditPurchaseInvoice = async (req, res) => {
   try {
     const invoice = await PurchaseInvoice.findById(req.params.id);
@@ -218,36 +154,43 @@ const forceEditPurchaseInvoice = async (req, res) => {
     if (invoice.status === 'cancelled')
       return res.status(400).json({ message: 'الفاتورة ملغية' });
 
-    // لو مطبقة على المخزن — ارجعها
+    // لو موافق عليها — ارجع المخزون
     if (invoice.status === 'approved') {
-      await revertInvoiceFromStock(invoice);
+      for (const inv of invoice.items) {
+        await Item.findByIdAndUpdate(inv.item, {
+          $inc: {
+            [`stock.${invoice.warehouse}.quantity`]: -inv.quantity,
+            [`stock.${invoice.warehouse}.weight`]: -(inv.quantity * inv.weight),
+          },
+        });
+      }
+      await StockMovement.deleteMany({ referenceId: invoice._id });
     }
 
     const { docNumber, date, items, notes, editNotes } = req.body;
 
     if (docNumber && docNumber !== invoice.docNumber) {
-      const docExists = await PurchaseInvoice.findOne({
+      const exists = await PurchaseInvoice.findOne({
         docNumber,
         season: invoice.season,
         _id: { $ne: invoice._id },
       });
-      if (docExists)
+      if (exists)
         return res
           .status(400)
-          .json({ message: 'رقم المستند موجود بالفعل في هذا الموسم' });
+          .json({ message: 'رقم المستند موجود في هذا الموسم' });
     }
 
     const recalcItems = items.map((i) => ({
       ...i,
       total: calcItemTotal(i.quantity, i.weight, i.price),
     }));
-
     invoice.docNumber = docNumber || invoice.docNumber;
     invoice.date = date || invoice.date;
     invoice.items = recalcItems;
     invoice.totalAmount = recalcItems.reduce((s, i) => s + i.total, 0);
     invoice.totalWeight = recalcItems.reduce(
-      (s, i) => s + calcItemTotalWeight(i.quantity, i.weight),
+      (s, i) => s + Number(i.quantity) * Number(i.weight),
       0,
     );
     invoice.notes = notes ?? invoice.notes;
@@ -265,13 +208,13 @@ const forceEditPurchaseInvoice = async (req, res) => {
       { path: 'editedBy', select: 'name' },
       { path: 'season', select: 'name' },
     ]);
-    res.json({ message: 'تم التعديل بواسطة الأدمن ✅', invoice });
+    res.json({ message: 'تم التعديل ✅', invoice });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// ── APPROVE ────────────────────────────────────────────────
+// ── APPROVE ───────────────────────────────────────────────────────────────────
 const approvePurchaseInvoice = async (req, res) => {
   try {
     const invoice = await PurchaseInvoice.findById(req.params.id);
@@ -282,8 +225,33 @@ const approvePurchaseInvoice = async (req, res) => {
     if (invoice.status === 'cancelled')
       return res.status(400).json({ message: 'الفاتورة ملغية' });
 
-    await applyInvoiceToStock(invoice, req.user._id);
-
+    for (const invoiceItem of invoice.items) {
+      const totalItemWeight =
+        Number(invoiceItem.quantity) * Number(invoiceItem.weight);
+      await Item.findByIdAndUpdate(invoiceItem.item, {
+        $inc: {
+          [`stock.${invoice.warehouse}.quantity`]: invoiceItem.quantity,
+          [`stock.${invoice.warehouse}.weight`]: totalItemWeight,
+        },
+        $set: { lastPurchasePrice: invoiceItem.price },
+      });
+      await StockMovement.create({
+        item: invoiceItem.item,
+        itemCode: invoiceItem.itemCode,
+        itemName: invoiceItem.itemName,
+        type: 'purchase',
+        quantity: invoiceItem.quantity,
+        weight: totalItemWeight,
+        price: invoiceItem.price,
+        warehouse: invoice.warehouse,
+        reference: invoice.invoiceNumber,
+        referenceModel: 'PurchaseInvoice',
+        referenceId: invoice._id,
+        season: invoice.season,
+        createdBy: req.user._id,
+        date: invoice.date,
+      });
+    }
     invoice.status = 'approved';
     invoice.approvedBy = req.user._id;
     invoice.approvedAt = new Date();
@@ -294,7 +262,7 @@ const approvePurchaseInvoice = async (req, res) => {
   }
 };
 
-// ── SUSPEND ────────────────────────────────────────────────
+// ── SUSPEND ───────────────────────────────────────────────────────────────────
 const suspendPurchaseInvoice = async (req, res) => {
   try {
     const invoice = await PurchaseInvoice.findById(req.params.id);
@@ -303,7 +271,7 @@ const suspendPurchaseInvoice = async (req, res) => {
     if (invoice.status === 'approved')
       return res
         .status(400)
-        .json({ message: 'مينفعش تعلق فاتورة اتوافق عليها' });
+        .json({ message: 'مينفعش تعلق فاتورة موافق عليها' });
     invoice.status = 'suspended';
     invoice.suspendReason = req.body.reason || '';
     await invoice.save();
@@ -313,7 +281,7 @@ const suspendPurchaseInvoice = async (req, res) => {
   }
 };
 
-// ── CANCEL ─────────────────────────────────────────────────
+// ── CANCEL ────────────────────────────────────────────────────────────────────
 const cancelPurchaseInvoice = async (req, res) => {
   try {
     const invoice = await PurchaseInvoice.findById(req.params.id);
@@ -322,7 +290,7 @@ const cancelPurchaseInvoice = async (req, res) => {
     if (invoice.status === 'approved')
       return res
         .status(400)
-        .json({ message: 'مينفعش تلغي فاتورة اتوافق عليها — عدّلها الأول' });
+        .json({ message: 'مينفعش تلغي فاتورة موافق عليها' });
     invoice.status = 'cancelled';
     await invoice.save();
     res.json({ message: 'تم الإلغاء', invoice });
@@ -331,6 +299,7 @@ const cancelPurchaseInvoice = async (req, res) => {
   }
 };
 
+// ── GET ITEM MOVEMENTS ── ← الإصلاح الرئيسي: populate season ────────────────
 const getItemMovements = async (req, res) => {
   try {
     const { itemId } = req.params;
@@ -345,8 +314,8 @@ const getItemMovements = async (req, res) => {
     }
     const movements = await StockMovement.find(query)
       .populate('createdBy', 'name')
-      .populate('season', 'name') // ← جديد: اسم الموسم
-      .sort({ date: -1 });
+      .populate('season', 'name') // ← الإصلاح: كان ناقص
+      .sort({ date: -1, createdAt: -1 });
     res.json(movements);
   } catch (err) {
     res.status(500).json({ message: err.message });
