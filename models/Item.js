@@ -1,34 +1,27 @@
 const mongoose = require('mongoose');
 
 const itemSchema = new mongoose.Schema({
-  code: { type: String, required: true, unique: true, trim: true },
-  name: { type: String, required: true, trim: true },
-  category: { type: String, trim: true },  // مكسرات / فول / جوز هند ...
-  unit: { type: String, default: 'كرتون' },  // وحدة القياس
-  
-  // المخزون في كل مخزن
+  code:     { type: String, required: true, unique: true, trim: true },
+  name:     { type: String, required: true, trim: true },
+  category: { type: String, trim: true },
+  unit:     { type: String, default: 'كرتون' },
+
   stock: {
-    ramses: { 
-      quantity: { type: Number, default: 0 },  // عدد كراتين
-      weight: { type: Number, default: 0 },    // إجمالي الوزن كيلو
-    },
-    october: {
-      quantity: { type: Number, default: 0 },
-      weight: { type: Number, default: 0 },
-    },
+    ramses:  { quantity: { type: Number, default: 0 }, weight: { type: Number, default: 0 } },
+    october: { quantity: { type: Number, default: 0 }, weight: { type: Number, default: 0 } },
   },
 
-  // الوزن الافتراضي للوحدة (مثلاً الكرتون = 22.68 كيلو)
-  defaultWeight: { type: Number, default: 0 },
-
-  // آخر سعر توريد — بيساعد في المراجعة
+  defaultWeight:     { type: Number, default: 0 },
   lastPurchasePrice: { type: Number, default: 0 },
-  // آخر سعر بيع
-  lastSalePrice: { type: Number, default: 0 },
-
-  isRawMaterial: { type: Boolean, default: false }, // خامة تصنيع؟
-  isActive: { type: Boolean, default: true },
-  notes: { type: String },
+  lastSalePrice:     { type: Number, default: 0 },
+  isRawMaterial:     { type: Boolean, default: false },
+  isActive:          { type: Boolean, default: true },
+  notes:             { type: String },
 }, { timestamps: true });
+
+// ── Indexes ────────────────────────────────────────────────────────────────
+// البحث النصي في ItemSearch
+itemSchema.index({ name: 1 });
+itemSchema.index({ isActive: 1, code: 1 });
 
 module.exports = mongoose.model('Item', itemSchema);

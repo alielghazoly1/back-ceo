@@ -1,4 +1,5 @@
 const ReturnInvoice  = require('../models/ReturnInvoice');
+const { audit }      = require('../utils/auditHelper');
 const Item           = require('../models/Item');
 const StockMovement  = require('../models/StockMovement');
 const Season         = require('../models/Season');
@@ -86,6 +87,7 @@ const createReturn = async (req, res) => {
       createdBy: req.user._id,
     });
 
+    await audit(req.user, 'return_created', 'ReturnInvoice', returnInv._id, returnInv.invoiceNumber, { type, totalAmount: returnInv.totalAmount });
     res.status(201).json(returnInv);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -148,6 +150,7 @@ const approveReturn = async (req, res) => {
     returnInv.approvedAt = new Date();
     await returnInv.save();
 
+    await audit(req.user, 'return_approved', 'ReturnInvoice', returnInv._id, returnInv.invoiceNumber, { totalAmount: returnInv.totalAmount });
     res.json({ message: 'تم الموافقة على المرتجع ✅', returnInv });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -161,6 +164,7 @@ const rejectReturn = async (req, res) => {
     if (!returnInv) return res.status(404).json({ message: 'المرتجع مش موجود' });
     returnInv.status = 'rejected';
     await returnInv.save();
+    await audit(req.user, 'return_rejected', 'ReturnInvoice', returnInv._id, returnInv.invoiceNumber);
     res.json({ message: 'تم الرفض', returnInv });
   } catch (err) {
     res.status(500).json({ message: err.message });

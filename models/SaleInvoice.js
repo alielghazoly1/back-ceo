@@ -12,18 +12,17 @@ const saleItemSchema = new mongoose.Schema({
 
 const saleInvoiceSchema = new mongoose.Schema({
   invoiceNumber: { type: String, required: true, unique: true },
+  docNumber:     { type: String, required: true, trim: true },
+  date:          { type: Date,   required: true, default: Date.now },
 
-  // ← مش unique globally — compound index هو اللي بيعمل uniqueness per season
-  docNumber: { type: String, required: true, trim: true },
-
-  date:         { type: Date, required: true, default: Date.now },
   customer:     { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
   customerCode: { type: String, required: true },
   customerName: { type: String, required: true },
   warehouse:    { type: String, enum: ['ramses', 'october'], required: true },
-  items:        [saleItemSchema],
-  totalAmount:  { type: Number, required: true },
-  totalWeight:  { type: Number, default: 0 },
+
+  items:       [saleItemSchema],
+  totalAmount: { type: Number, required: true },
+  totalWeight: { type: Number, default: 0 },
 
   paidAmount:     { type: Number, default: 0 },
   cashAmount:     { type: Number, default: 0 },
@@ -52,9 +51,25 @@ const saleInvoiceSchema = new mongoose.Schema({
   editNotes:  { type: String },
 }, { timestamps: true });
 
-// docNumber فريد داخل نفس الموسم فقط
+// ── Indexes ────────────────────────────────────────────────────────────────
+// Uniqueness per season
 saleInvoiceSchema.index({ docNumber: 1, season: 1 }, { unique: true });
 
-// MIGRATION: db.saleinvoices.dropIndex("docNumber_1")
+// الأكثر استخداماً — قائمة فواتير العميل + الـ aggregation
+saleInvoiceSchema.index({ customer: 1, status: 1 });
+saleInvoiceSchema.index({ customer: 1, paymentMethod: 1, status: 1 });
+
+// قائمة فواتير الموسم (الصفحة الرئيسية + التقارير)
+saleInvoiceSchema.index({ season: 1, status: 1 });
+saleInvoiceSchema.index({ season: 1, createdAt: -1 });
+
+// بحث الأدمن بالتاريخ
+saleInvoiceSchema.index({ createdAt: -1 });
+saleInvoiceSchema.index({ date: -1 });
+
+// بحث بـ invoiceNumber (عرض فاتورة)
+// invoiceNumber مكفول بـ unique: true أعلاه
+
+// MIGRATION NOTE: db.saleinvoices.dropIndex("docNumber_1")
 
 module.exports = mongoose.model('SaleInvoice', saleInvoiceSchema);

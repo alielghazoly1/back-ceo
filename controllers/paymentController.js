@@ -1,9 +1,10 @@
 // ════════════════════════════════════════════
 //  server/controllers/paymentController.js
 // ════════════════════════════════════════════
-const Payment = require('../models/Payment');
+const Payment       = require('../models/Payment');
+const { audit }     = require('../utils/auditHelper');
 const { recordPayment } = require('../utils/treasuryHelper');
-const Season = require('../models/Season');
+const Season  = require('../models/Season');
 
 const getPayments = async (req, res) => {
   try {
@@ -11,8 +12,8 @@ const getPayments = async (req, res) => {
     let query = {};
     if (customerId) query.customer = customerId;
     if (supplierId) query.supplier = supplierId;
-    if (seasonId) query.season = seasonId;
-    if (type) query.type = type;
+    if (seasonId)   query.season   = seasonId;
+    if (type)       query.type     = type;
 
     const payments = await Payment.find(query)
       .populate('createdBy', 'name')
@@ -42,32 +43,20 @@ const createPayment = async (req, res) => {
   try {
     const {
       type,
-      customerId,
-      customerCode,
-      customerName,
-      supplierId,
-      supplierCode,
-      supplierName,
-      amount,
-      paymentMethod,
-      cashAmount,
-      instapayAmount,
-      notes,
-      reference,
-      receiptNumber, // ← رقم الوصل اليدوي
-      date,
-      seasonId,
+      customerId, customerCode, customerName,
+      supplierId, supplierCode, supplierName,
+      amount, paymentMethod,
+      cashAmount, instapayAmount,
+      notes, reference,
+      receiptNumber,   // ← رقم الوصل اليدوي
+      date, seasonId,
     } = req.body;
 
     // التحقق من رقم الوصل لو موجود
     if (receiptNumber?.trim()) {
-      const exists = await Payment.findOne({
-        receiptNumber: receiptNumber.trim(),
-      });
+      const exists = await Payment.findOne({ receiptNumber: receiptNumber.trim() });
       if (exists) {
-        return res
-          .status(400)
-          .json({ message: `رقم الوصل "${receiptNumber}" موجود بالفعل` });
+        return res.status(400).json({ message: `رقم الوصل "${receiptNumber}" موجود بالفعل` });
       }
     }
 
@@ -81,19 +70,14 @@ const createPayment = async (req, res) => {
 
     const payment = await Payment.create({
       type,
-      customer: customerId,
-      customerCode,
-      customerName,
-      supplier: supplierId,
-      supplierCode,
-      supplierName,
+      customer: customerId, customerCode, customerName,
+      supplier: supplierId, supplierCode, supplierName,
       season: season._id,
       amount: Number(amount),
       paymentMethod: paymentMethod || 'cash',
-      cashAmount: Number(cashAmount) || 0,
+      cashAmount:    Number(cashAmount)    || 0,
       instapayAmount: Number(instapayAmount) || 0,
-      notes,
-      reference,
+      notes, reference,
       receiptNumber: receiptNumber?.trim() || null,
       date: date || Date.now(),
       createdBy: req.user._id,
@@ -104,6 +88,7 @@ const createPayment = async (req, res) => {
     // ── تسجيل في الخزنة (نقدي للأدمن + بنكي للبنك) ───────────
     await recordPayment(payment, req.user);
 
+    await audit(req.user, 'payment_created', 'Payment', payment._id, payment.receiptNumber || payment._id.toString().slice(-6), { amount: payment.amount, type: payment.type, customerName: payment.customerName, supplierName: payment.supplierName });
     res.status(201).json(populated);
   } catch (err) {
     if (err.code === 11000) {
@@ -120,40 +105,29 @@ const updatePayment = async (req, res) => {
     if (!payment) return res.status(404).json({ message: 'الدفعة مش موجودة' });
 
     const {
-      amount,
-      paymentMethod,
-      cashAmount,
-      instapayAmount,
-      notes,
-      reference,
-      receiptNumber,
-      date,
+      amount, paymentMethod, cashAmount, instapayAmount,
+      notes, reference, receiptNumber, date,
     } = req.body;
 
     // التحقق من رقم الوصل لو اتغير
-    if (
-      receiptNumber?.trim() &&
-      receiptNumber.trim() !== payment.receiptNumber
-    ) {
+    if (receiptNumber?.trim() && receiptNumber.trim() !== payment.receiptNumber) {
       const exists = await Payment.findOne({
         receiptNumber: receiptNumber.trim(),
         _id: { $ne: payment._id },
       });
       if (exists) {
-        return res
-          .status(400)
-          .json({ message: `رقم الوصل "${receiptNumber}" موجود بالفعل` });
+        return res.status(400).json({ message: `رقم الوصل "${receiptNumber}" موجود بالفعل` });
       }
     }
 
-    payment.amount = Number(amount) || payment.amount;
-    payment.paymentMethod = paymentMethod || payment.paymentMethod;
-    payment.cashAmount = Number(cashAmount) || 0;
-    payment.instapayAmount = Number(instapayAmount) || 0;
-    payment.notes = notes ?? payment.notes;
-    payment.reference = reference ?? payment.reference;
-    payment.receiptNumber = receiptNumber?.trim() || payment.receiptNumber;
-    payment.date = date || payment.date;
+    payment.amount         = Number(amount)         || payment.amount;
+    payment.paymentMethod  = paymentMethod           || payment.paymentMethod;
+    payment.cashAmount     = Number(cashAmount)      || 0;
+    payment.instapayAmount = Number(instapayAmount)  || 0;
+    payment.notes          = notes          ?? payment.notes;
+    payment.reference      = reference      ?? payment.reference;
+    payment.receiptNumber  = receiptNumber?.trim() || payment.receiptNumber;
+    payment.date           = date           || payment.date;
 
     await payment.save();
     const updated = await payment.populate('createdBy', 'name');
@@ -175,13 +149,8 @@ const deletePayment = async (req, res) => {
   }
 };
 
-module.exports = {
-  getPayments,
-  checkReceiptNumber,
-  createPayment,
-  updatePayment,
-  deletePayment,
-};
+module.exports = { getPayments, checkReceiptNumber, createPayment, updatePayment, deletePayment };
+
 
 // ════════════════════════════════════════════
 //  server/routes/paymentRoutes.js

@@ -54,6 +54,7 @@ app.use('/api/transfers', require('./routes/transferRoutes'));
 app.use('/api/manufacturing', require('./routes/manufacturingRoutes'));
 app.use('/api/reports', require('./routes/reportRoutes'));
 app.use('/api/price-list', require('./routes/priceListRoutes'));
+app.use('/api/audit', require('./routes/auditRoutes'));
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'API شغال ✅' }));
 
 app.use(notFound);
